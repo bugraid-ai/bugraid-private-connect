@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  BugRaid AI — Site-to-Site VPN (BugRaid side).
+  Creates a Virtual Private Gateway + Customer Gateway + VPN Connection between
+  BugRaid's VPC and the customer's on-premise or cloud IPsec firewall, plus a
+  Route 53 Resolver outbound endpoint so melt-fetcher can resolve internal
+  customer hostnames (e.g. grafana.customer.internal) by forwarding DNS queries
+  through the tunnel. Deploy one stack per customer.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Customer identity
+        Parameters:
+          - CustomerSlug
+      - Label:
+          default: Customer IPsec endpoint (provided by customer's network team)
+        Parameters:
+          - CustomerFirewallPublicIp
+          - CustomerBgpAsn
+          - CustomerCidr
+          - UseStaticRoutes
+      - Label:
+          default: Customer DNS (so we can resolve their internal hostnames)
+        Parameters:
+          - CustomerDnsDomain
+          - CustomerDnsServerIp
+      - Label:
+          default: BugRaid network (defaults are correct for dev)
+        Parameters:
+          - BugRaidVpcId
+          - BugRaidVpcCidr
+          - BugRaidPrivateSubnetIds
+          - BugRaidRouteTableIds
+    ParameterLabels:
+      CustomerSlug:
+        default: Short customer slug (used in resource names + tags)
+      CustomerFirewallPublicIp:
+        default: Public IP of customer's IPsec endpoint
+      CustomerBgpAsn:
+        default: BGP ASN of customer's firewall (private range 64512-65534, or registered ASN)
+      CustomerCidr:
+        default: Customer VPC / on-prem CIDR (e.g. 172.16.46.0/23)
+      UseStaticRoutes:
+        default: Use static routes instead of BGP? (true if customer firewall doesn't support BGP)
+      CustomerDnsDomain:
+        default: Customer DNS domain we'll forward (e.g. wework.co.in)
+      CustomerDnsServerIp:
+        default: Customer internal DNS server IP that resolves the domain
+      BugRaidVpcId:
+        default: BugRaid VPC ID
+      BugRaidVpcCidr:
+        default: BugRaid VPC CIDR (advertised to customer via BGP)
+      BugRaidPrivateSubnetIds:
+        default: ≥2 private subnet IDs in different AZs (for Resolver outbound endpoint ENIs)
+      BugRaidRouteTableIds:
+        default: Route tables that should learn customer CIDR via VPN propagation
+
+Parameters:
+  CustomerSlug:
+    Type: String
+    Description: >
+      Short, stable customer identifier. Lower-case, hyphenated.
+      Examples: wework, qubehealth, taxbuddy.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+    ConstraintDescription: lower-case letters, digits, hyphens; 2–31 characters.
+
+  CustomerFirewallPublicIp:
+    Type: String
+    Description: >
+      Public IPv4 of the customer's IPsec endpoint (the firewall their network
+      team configures). AWS Site-to-Site VPN initiates the tunnel to this IP.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+    ConstraintDescription: must be a valid IPv4 address.
+
+  CustomerBgpAsn:
+    Type: Number
+    Description: >
+      Customer's BGP Autonomous System Number. Use a private ASN
+      (64512-65534) unless they have a registered public ASN. If their firewall
+      doesn't support BGP, set UseStaticRoutes=true and any valid number here.
+    MinValue: 1
+    MaxValue: 4294967294
+    Default: 65000
+
+  CustomerCidr:
+    Type: String
+    Description: >
+      Customer's internal network CIDR. Traffic destined for this CIDR is
+      routed through the VPN tunnel. Must NOT overlap with BugRaid's CIDR.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:3[0-2]|[12]?[0-9])$'
+    ConstraintDescription: must be a valid CIDR block (e.g. 172.16.46.0/23).
+
+  UseStaticRoutes:
+    Type: String
+    Description: >
+      Set to true if the customer's firewall does NOT support BGP. AWS will
+      use static routes instead. Default is BGP (false) which is cleaner.
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Default: 'false'
+
+  CustomerDnsDomain:
+    Type: String
+    Description: >
+      DNS suffix to forward to customer's internal DNS server via this tunnel.
+      Example: wework.co.in. melt-fetcher's queries for *.wework.co.in will be
+      sent to the customer DNS server through the VPN.
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+    ConstraintDescription: must be a valid DNS domain name.
+
+  CustomerDnsServerIp:
+    Type: String
+    Description: >
+      Customer's internal DNS server IP (reachable through the VPN tunnel,
+      typically inside their CIDR). melt-fetcher's Route 53 Resolver outbound
+      endpoint forwards queries here.
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+    ConstraintDescription: must be a valid IPv4 address inside customer's CIDR.
+
+  BugRaidVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: BugRaid's VPC where the VGW attaches and Resolver endpoint lives.
+
+  BugRaidVpcCidr:
+    Type: String
+    Description: >
+      BugRaid's VPC CIDR (advertised back to the customer). Default matches
+      the dev VPC; change for prod.
+    Default: '10.250.0.0/16'
+    AllowedPattern: '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:3[0-2]|[12]?[0-9])$'
+
+  BugRaidPrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      ≥2 BugRaid private subnet IDs in different AZs. Route 53 Resolver outbound
+      endpoint creates an ENI in each. Pick the same subnets where
+      melt-fetcher runs so DNS resolution latency is minimal.
+
+  BugRaidRouteTableIds:
+    Type: CommaDelimitedList
+    Description: >
+      Route table IDs that should learn the customer CIDR via VPN route
+      propagation. Typically the BugRaid VPC's private subnet route tables.
+
+Conditions:
+  IsBgp: !Equals [!Ref UseStaticRoutes, 'false']
+  IsStatic: !Equals [!Ref UseStaticRoutes, 'true']
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Customer Gateway — represents the customer's IPsec endpoint in AWS.
+  # ---------------------------------------------------------------------------
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      IpAddress: !Ref CustomerFirewallPublicIp
+      BgpAsn: !Ref CustomerBgpAsn
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-cgw'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+        - Key: Pattern
+          Value: s2s-vpn
+
+  # ---------------------------------------------------------------------------
+  # Virtual Private Gateway — the BugRaid-side IPsec endpoint.
+  # ---------------------------------------------------------------------------
+  VpnGateway:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-vgw'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+
+  # ---------------------------------------------------------------------------
+  # Attach the VGW to BugRaid's VPC. Without this, no traffic flows.
+  # ---------------------------------------------------------------------------
+  VpnGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref BugRaidVpcId
+      VpnGatewayId: !Ref VpnGateway
+
+  # ---------------------------------------------------------------------------
+  # The actual VPN connection — 2 IPsec tunnels for HA. AWS auto-provisions
+  # the two tunnel endpoints. After CREATE_COMPLETE the AWS console + CLI
+  # expose the IPsec config file (downloadable per firewall vendor).
+  # ---------------------------------------------------------------------------
+  VpnConnection:
+    Type: AWS::EC2::VPNConnection
+    DependsOn: VpnGatewayAttachment
+    Properties:
+      Type: ipsec.1
+      CustomerGatewayId: !Ref CustomerGateway
+      VpnGatewayId: !Ref VpnGateway
+      StaticRoutesOnly: !If [IsStatic, true, false]
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-vpn'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+
+  # ---------------------------------------------------------------------------
+  # Static route for customer CIDR (only if BGP is disabled).
+  # With BGP, the customer's firewall advertises this route dynamically.
+  # ---------------------------------------------------------------------------
+  CustomerStaticRoute:
+    Type: AWS::EC2::VPNConnectionRoute
+    Condition: IsStatic
+    Properties:
+      DestinationCidrBlock: !Ref CustomerCidr
+      VpnConnectionId: !Ref VpnConnection
+
+  # ---------------------------------------------------------------------------
+  # Propagate VPN routes into BugRaid VPC route tables. This makes the
+  # customer's CIDR reachable from BugRaid's subnets without manually
+  # editing the route tables.
+  # ---------------------------------------------------------------------------
+  VpnRoutePropagation:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VpnGatewayAttachment
+    Properties:
+      RouteTableIds: !Ref BugRaidRouteTableIds
+      VpnGatewayId: !Ref VpnGateway
+
+  # ---------------------------------------------------------------------------
+  # Security group for the Route 53 Resolver outbound endpoint ENIs. The
+  # ENIs need to send DNS queries (UDP+TCP/53) to the customer's DNS server
+  # IP. Inbound on 53 is required for DNS replies.
+  # ---------------------------------------------------------------------------
+  ResolverEndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub 'bugraid-${CustomerSlug}-resolver-sg'
+      GroupDescription: !Sub 'Outbound DNS for ${CustomerSlug} via S2S VPN'
+      VpcId: !Ref BugRaidVpcId
+      SecurityGroupEgress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub '${CustomerDnsServerIp}/32'
+          Description: 'DNS queries to customer DNS server (UDP)'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Sub '${CustomerDnsServerIp}/32'
+          Description: 'DNS queries to customer DNS server (TCP, for large responses)'
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref BugRaidVpcCidr
+          Description: 'DNS queries from melt-fetcher Fargate tasks'
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref BugRaidVpcCidr
+          Description: 'DNS queries (TCP) from melt-fetcher Fargate tasks'
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-resolver-sg'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+
+  # ---------------------------------------------------------------------------
+  # Route 53 Resolver outbound endpoint. ENIs in BugRaid's private subnets
+  # forward matching DNS queries through the VPN to customer's DNS server.
+  # ---------------------------------------------------------------------------
+  ResolverOutboundEndpoint:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    Properties:
+      Name: !Sub 'bugraid-${CustomerSlug}-outbound'
+      Direction: OUTBOUND
+      SecurityGroupIds:
+        - !Ref ResolverEndpointSg
+      IpAddresses:
+        - SubnetId: !Select [0, !Ref BugRaidPrivateSubnetIds]
+        - SubnetId: !Select [1, !Ref BugRaidPrivateSubnetIds]
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-outbound'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+
+  # ---------------------------------------------------------------------------
+  # Resolver rule — when a DNS query matches CustomerDnsDomain, forward to
+  # CustomerDnsServerIp via the outbound endpoint above.
+  # ---------------------------------------------------------------------------
+  ResolverRule:
+    Type: AWS::Route53Resolver::ResolverRule
+    Properties:
+      Name: !Sub 'bugraid-${CustomerSlug}-forward-${CustomerDnsDomain}'
+      DomainName: !Ref CustomerDnsDomain
+      RuleType: FORWARD
+      ResolverEndpointId: !Ref ResolverOutboundEndpoint
+      TargetIps:
+        - Ip: !Ref CustomerDnsServerIp
+          Port: 53
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-forward-rule'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+
+  # ---------------------------------------------------------------------------
+  # Associate the rule with BugRaid VPC so the VPC actually uses it.
+  # ---------------------------------------------------------------------------
+  ResolverRuleAssociation:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Properties:
+      Name: !Sub 'bugraid-${CustomerSlug}-rule-attach'
+      ResolverRuleId: !Ref ResolverRule
+      VPCId: !Ref BugRaidVpcId
+
+Outputs:
+  VpnConnectionId:
+    Description: VPN Connection ID. Use this to download the IPsec config file for the customer's firewall.
+    Value: !Ref VpnConnection
+    Export:
+      Name: !Sub '${AWS::StackName}-VpnConnectionId'
+
+  VpnGatewayId:
+    Description: Virtual Private Gateway ID.
+    Value: !Ref VpnGateway
+
+  CustomerGatewayId:
+    Description: Customer Gateway ID (representing customer's firewall).
+    Value: !Ref CustomerGateway
+
+  ResolverEndpointId:
+    Description: Route 53 Resolver outbound endpoint ID.
+    Value: !Ref ResolverOutboundEndpoint
+
+  ResolverRuleId:
+    Description: Resolver forwarding rule ID.
+    Value: !Ref ResolverRule
+
+  DownloadConfigCommand:
+    Description: >
+      CLI command to get the AWS-generated IPsec configuration for the customer's
+      firewall. Replace --device-type for the customer's vendor (e.g. paloalto-pa,
+      cisco-asa-5500-ios-12.4+, fortinet-fortigate-50plus, sonicwall-tz-series-6,
+      juniper-srx-junos-12.x). See full list:
+      https://docs.aws.amazon.com/vpn/latest/s2svpn/customer-gateway-devices.html
+    Value: !Sub >
+      aws ec2 get-vpn-connection-device-sample-configuration
+      --vpn-connection-id ${VpnConnection}
+      --vpn-connection-device-type-id <vendor-id>
+      --region ${AWS::Region}
+      --output text
+
+  Instructions:
+    Description: Next steps after stack reaches CREATE_COMPLETE.
+    Value: !Sub >
+      (1) Download the IPsec config for the customer's firewall vendor using
+      DownloadConfigCommand. (2) Send the config file to the customer's network
+      team via the shared Slack channel. (3) Customer applies the config to
+      their firewall and adds an inbound rule allowing ${BugRaidVpcCidr} on the
+      tool's port (e.g. 443 for Grafana). (4) Verify tunnel UP in AWS console
+      → VPC → VPN connections → Tunnel details. (5) From a melt-fetcher
+      Fargate task: nslookup grafana.${CustomerDnsDomain} should resolve to
+      an IP in ${CustomerCidr}. (6) curl -v https://<tool-hostname> should
+      complete TLS handshake against the customer's existing cert.
