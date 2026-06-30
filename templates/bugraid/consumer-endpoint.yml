@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  BugRaid AI — Reverse PrivateLink (BugRaid consumer side).
+  Creates an Interface VPC Endpoint pointing at the customer's VPC Endpoint Service,
+  plus a Private Hosted Zone that aliases the tool's original hostname to the
+  endpoint ENIs. melt-fetcher then resolves the customer's tool hostname privately
+  and reaches it over the AWS backbone with the tool's existing TLS cert intact.
+  Deploy one stack per customer per tool.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Customer + tool identity
+        Parameters:
+          - CustomerSlug
+          - ToolName
+          - ToolHostname
+          - ToolPort
+      - Label:
+          default: Customer's PrivateLink service (from their stack outputs)
+        Parameters:
+          - ServiceName
+          - ServiceRegion
+      - Label:
+          default: BugRaid network (where melt-fetcher runs)
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - SecurityGroupIds
+    ParameterLabels:
+      CustomerSlug:
+        default: Short customer slug (used in resource names)
+      ToolName:
+        default: Tool identifier (matches the customer's stack)
+      ToolHostname:
+        default: The hostname melt-fetcher will use to reach this tool
+      ToolPort:
+        default: TCP port (matches the customer's stack)
+      ServiceName:
+        default: VPC Endpoint Service name (from customer's stack output)
+      ServiceRegion:
+        default: AWS region where the customer's service lives
+
+Parameters:
+  CustomerSlug:
+    Type: String
+    Description: >
+      Short, stable identifier for this customer. Lower-case, hyphenated.
+      Example: wework, qubehealth, taxbuddy.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+    ConstraintDescription: lower-case letters, digits, hyphens; 2–31 characters.
+
+  ToolName:
+    Type: String
+    Description: >
+      Matches the ToolName from the customer's reverse-privatelink stack.
+      Example: grafana, jira, prometheus.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+
+  ToolHostname:
+    Type: String
+    Description: >
+      The hostname melt-fetcher uses to reach this tool. Use the customer's
+      ACTUAL internal hostname (e.g. grafana.weworkindia.internal) so TLS
+      handshake works against the tool's existing certificate. This name will
+      only resolve inside BugRaid's VPC via the Private Hosted Zone this stack
+      creates — it does not affect public DNS.
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+    ConstraintDescription: must be a valid FQDN (at least one dot, lower-case).
+
+  ToolPort:
+    Type: Number
+    Description: TCP port (matches the customer's stack).
+    Default: 443
+    MinValue: 1
+    MaxValue: 65535
+
+  ServiceName:
+    Type: String
+    Description: >
+      Full VPC Endpoint Service name from the customer's stack output. Format:
+      com.amazonaws.vpce.<region>.vpce-svc-XXXXXXXX
+    AllowedPattern: '^com\.amazonaws\.vpce\.[a-z0-9-]+\.vpce-svc-[a-f0-9]+$'
+
+  ServiceRegion:
+    Type: String
+    Description: >
+      AWS region where the customer's service lives. If same as BugRaid's region
+      (ap-southeast-1), it's same-region. Otherwise, this is a cross-region
+      PrivateLink (slightly higher data-transfer cost, see docs/cost-estimate.md).
+    Default: ap-southeast-1
+    AllowedPattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: BugRaid's VPC. The Interface Endpoint ENIs will be created here.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: ≥2 private subnet IDs in different AZs (where melt-fetcher Fargate tasks run).
+
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: >
+      SG(s) to attach to the endpoint ENIs. Must allow inbound on ToolPort
+      from melt-fetcher's SG. Conventionally we use bugraid-private-connect-sg
+      which is locked down to the melt-fetcher Fargate task role.
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Interface VPC Endpoint: the consumer side of the PrivateLink connection.
+  # AWS will reach out to the customer's Endpoint Service. The customer must
+  # accept the connection (one-time, manual) before traffic flows.
+  # PrivateDnsEnabled is false because PrivateLink-as-a-service custom names
+  # are handled via our own Private Hosted Zone below.
+  # ---------------------------------------------------------------------------
+  InterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Ref ServiceName
+      ServiceRegion: !Ref ServiceRegion
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: !Ref SecurityGroupIds
+      PrivateDnsEnabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-${ToolName}-endpoint'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+        - Key: Tool
+          Value: !Ref ToolName
+
+  # ---------------------------------------------------------------------------
+  # Private Hosted Zone scoped to BugRaid's VPC only. Holds the tool's hostname
+  # mapping. Public DNS is untouched.
+  #
+  # The zone is created for the EXACT tool hostname, with an alias record at
+  # the apex. So if ToolHostname=grafana.weworkindia.internal, the zone name is
+  # "grafana.weworkindia.internal" and the apex A-record aliases to the endpoint
+  # ENIs. This keeps the template fully parameter-driven without needing the
+  # operator to compute the parent zone separately.
+  # ---------------------------------------------------------------------------
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref ToolHostname
+      HostedZoneConfig:
+        Comment: !Sub 'bugraid-private-connect — ${CustomerSlug} ${ToolName}'
+      VPCs:
+        - VPCId: !Ref VpcId
+          VPCRegion: !Ref AWS::Region
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub 'bugraid-${CustomerSlug}-${ToolName}-phz'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Customer
+          Value: !Ref CustomerSlug
+
+  # ---------------------------------------------------------------------------
+  # A-record at the zone apex (same as ToolHostname) aliasing to the endpoint.
+  # The Interface Endpoint's first DnsEntries entry has format
+  # "<hosted-zone-id>:<dns-name>", which we split to feed the AliasTarget.
+  # ---------------------------------------------------------------------------
+  ToolHostnameRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Ref ToolHostname
+      Type: A
+      AliasTarget:
+        DNSName: !Select [1, !Split [':', !Select [0, !GetAtt InterfaceEndpoint.DnsEntries]]]
+        HostedZoneId: !Select [0, !Split [':', !Select [0, !GetAtt InterfaceEndpoint.DnsEntries]]]
+        EvaluateTargetHealth: false
+
+Outputs:
+  EndpointId:
+    Description: Interface Endpoint ID. Used in troubleshooting.
+    Value: !Ref InterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-EndpointId'
+
+  EndpointPrimaryDns:
+    Description: AWS-generated DNS for the endpoint (not used by melt-fetcher directly).
+    Value: !Select [1, !Split [':', !Select [0, !GetAtt InterfaceEndpoint.DnsEntries]]]
+
+  ToolHostnameForMeltFetcher:
+    Description: >
+      Use this hostname in the customer's integration record in dev-api. This is
+      what melt-fetcher will see in its Grafana / Jira / etc. config. The
+      Private Hosted Zone makes it resolve to the endpoint ENIs inside
+      BugRaid's VPC only.
+    Value: !Sub 'https://${ToolHostname}:${ToolPort}'
+
+  PrivateHostedZoneId:
+    Description: Hosted zone ID (for follow-up DNS changes if a customer has multiple tools).
+    Value: !Ref PrivateHostedZone
+
+  AcceptConnectionCommand:
+    Description: >
+      If the customer's stack has AcceptanceRequired=true (default), the customer
+      must accept this connection in their VPC console one time. Alternatively,
+      the customer can run this CLI command after the endpoint is created.
+    Value: !Sub >
+      aws ec2 accept-vpc-endpoint-connections
+      --service-id <customer-service-id>
+      --vpc-endpoint-ids ${InterfaceEndpoint}
+      --region ${ServiceRegion}

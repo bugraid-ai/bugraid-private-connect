@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  BugRaid AI — Reverse PrivateLink (customer side).
+  Exposes one internal tool (Grafana / Jira / Prometheus / GHE / etc.) to BugRaid
+  via an internal Network Load Balancer fronted by a VPC Endpoint Service.
+  The tool remains private inside your VPC; BugRaid connects over the AWS backbone.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Tool identity
+        Parameters:
+          - ToolName
+          - ToolPort
+      - Label:
+          default: Tool location (where the tool actually runs)
+        Parameters:
+          - TargetType
+          - TargetValue
+      - Label:
+          default: Network (your VPC, ≥2 private subnets in different AZs)
+        Parameters:
+          - VpcId
+          - SubnetIds
+      - Label:
+          default: BugRaid consumer (defaults are correct for production BugRaid)
+        Parameters:
+          - BugRaidAccountId
+          - BugRaidConsumerRegions
+      - Label:
+          default: Health check
+        Parameters:
+          - HealthCheckPath
+          - HealthCheckProtocol
+    ParameterLabels:
+      ToolName:
+        default: Friendly tool name (lower-case, used in resource names)
+      ToolPort:
+        default: TCP port the tool listens on (e.g. 443, 3000, 9090, 8080)
+      TargetType:
+        default: How the NLB finds the tool
+      TargetValue:
+        default: IP address, instance ID, or hostname of the tool
+      VpcId:
+        default: VPC ID where the NLB will live
+      SubnetIds:
+        default: ≥2 private subnet IDs in different AZs
+      BugRaidAccountId:
+        default: BugRaid AWS account ID (don't change unless instructed)
+      BugRaidConsumerRegions:
+        default: AWS region(s) where BugRaid will create the consumer endpoint
+
+Parameters:
+  ToolName:
+    Type: String
+    Description: >
+      Short identifier used in resource names and tags. Lower-case, no spaces.
+      Example: grafana, jira, prometheus, ghe.
+    AllowedPattern: '^[a-z][a-z0-9-]{1,30}$'
+    ConstraintDescription: lower-case letters, digits, hyphens; 2–31 characters.
+
+  ToolPort:
+    Type: Number
+    Description: >
+      The TCP port your tool listens on. NLB will accept traffic on this same port
+      and forward (passthrough) to the target. Grafana is usually 3000, GHE 443,
+      Prometheus 9090.
+    Default: 443
+    MinValue: 1
+    MaxValue: 65535
+
+  TargetType:
+    Type: String
+    Description: >
+      How the NLB finds your tool. "ip" works for any private IP including
+      pods/ENIs that have stable addresses. "instance" requires the tool to run
+      on EC2 with the instance ID known.
+    AllowedValues:
+      - ip
+      - instance
+    Default: ip
+
+  TargetValue:
+    Type: String
+    Description: >
+      The actual target. For TargetType=ip, a private IPv4 in your VPC (e.g.
+      10.0.1.42). For TargetType=instance, an EC2 instance ID (e.g. i-0abc…).
+      If your tool is behind an existing ALB/NLB, point at the ALB/NLB IPs
+      directly (look them up in the EC2 console under "Network interfaces").
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where your tool runs. The NLB will be created here.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      ≥2 private subnet IDs in DIFFERENT availability zones. The NLB requires
+      multi-AZ. Each subnet should be in the same VPC as VpcId.
+
+  BugRaidAccountId:
+    Type: String
+    Description: >
+      BugRaid AWS account ID that will be allowed to create a consumer endpoint
+      against your service. Confirm with your BugRaid TAM before changing.
+    Default: '528104389666'
+    AllowedPattern: '^[0-9]{12}$'
+
+  BugRaidConsumerRegions:
+    Type: CommaDelimitedList
+    Description: >
+      AWS region(s) where BugRaid will create the consumer Interface Endpoint.
+      Production BugRaid runs in ap-southeast-1 (Singapore). If your VPC is in a
+      different region, list ap-southeast-1 here so BugRaid can do cross-region
+      PrivateLink.
+    Default: 'ap-southeast-1'
+
+  HealthCheckPath:
+    Type: String
+    Description: >
+      HTTP path the NLB uses to health-check the target. Set to / for most tools.
+      Used only when HealthCheckProtocol=HTTP/HTTPS — ignored for TCP.
+    Default: /
+
+  HealthCheckProtocol:
+    Type: String
+    Description: >
+      How the NLB checks the target is alive. TCP is safest (no path needed) and
+      works for any TLS-terminating tool. HTTPS validates the tool's TLS layer.
+    AllowedValues:
+      - TCP
+      - HTTPS
+      - HTTP
+    Default: TCP
+
+Conditions:
+  IsIpTarget: !Equals [!Ref TargetType, ip]
+  IsHttpsHealthCheck: !Equals [!Ref HealthCheckProtocol, HTTPS]
+  IsHttpHealthCheck: !Equals [!Ref HealthCheckProtocol, HTTP]
+  IsPathHealthCheck: !Or [!Condition IsHttpsHealthCheck, !Condition IsHttpHealthCheck]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Target Group: where NLB forwards traffic.
+  # TCP protocol = L4 passthrough. The tool's TLS terminates at the tool itself,
+  # so the tool's existing cert keeps working. No cert work for you.
+  # ---------------------------------------------------------------------------
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'bugraid-${ToolName}-tg'
+      VpcId: !Ref VpcId
+      TargetType: !Ref TargetType
+      Protocol: TCP
+      Port: !Ref ToolPort
+      HealthCheckProtocol: !Ref HealthCheckProtocol
+      HealthCheckPort: !Ref ToolPort
+      HealthCheckPath: !If [IsPathHealthCheck, !Ref HealthCheckPath, !Ref AWS::NoValue]
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Targets:
+        - Id: !Ref TargetValue
+          Port: !Ref ToolPort
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${ToolName}-tg'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Tool
+          Value: !Ref ToolName
+
+  # ---------------------------------------------------------------------------
+  # Internal NLB. Scheme=internal means no public IP — only reachable from
+  # within your VPC or via the VPC Endpoint Service we attach next.
+  # ---------------------------------------------------------------------------
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'bugraid-${ToolName}-nlb'
+      Type: network
+      Scheme: internal
+      Subnets: !Ref SubnetIds
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${ToolName}-nlb'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Tool
+          Value: !Ref ToolName
+
+  # ---------------------------------------------------------------------------
+  # TCP listener at the tool's port. Passthrough — NLB does not decrypt.
+  # ---------------------------------------------------------------------------
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Protocol: TCP
+      Port: !Ref ToolPort
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # VPC Endpoint Service: exposes the NLB to other AWS accounts (BugRaid) over
+  # PrivateLink. AcceptanceRequired=true means every consumer connection must
+  # be explicitly accepted by you the first time. Allowed principals limits
+  # which AWS account can even attempt to connect.
+  # ---------------------------------------------------------------------------
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      AcceptanceRequired: true
+      NetworkLoadBalancerArns:
+        - !Ref NetworkLoadBalancer
+      SupportedRegions: !Ref BugRaidConsumerRegions
+      Tags:
+        - Key: Name
+          Value: !Sub 'bugraid-${ToolName}-endpoint-svc'
+        - Key: ManagedBy
+          Value: bugraid-private-connect
+        - Key: Tool
+          Value: !Ref ToolName
+
+  EndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref EndpointService
+      AllowedPrincipals:
+        - !Sub 'arn:aws:iam::${BugRaidAccountId}:root'
+
+Outputs:
+  ServiceName:
+    Description: >
+      The Endpoint Service name. Send this exact string to BugRaid — they need
+      it to create the consumer-side Interface Endpoint. Format:
+      com.amazonaws.vpce.<region>.vpce-svc-XXXXXXX
+    Value: !Sub 'com.amazonaws.vpce.${AWS::Region}.${EndpointService}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceName'
+
+  ServiceId:
+    Description: VPC Endpoint Service ID (used in customer-side troubleshooting commands).
+    Value: !Ref EndpointService
+
+  ServiceRegion:
+    Description: AWS region where the service runs. Send this to BugRaid alongside the Service Name.
+    Value: !Ref AWS::Region
+
+  NetworkLoadBalancerArn:
+    Description: ARN of the internal NLB this stack created.
+    Value: !Ref NetworkLoadBalancer
+
+  TargetGroupArn:
+    Description: ARN of the Target Group registered with the NLB.
+    Value: !Ref TargetGroup
+
+  ToolName:
+    Description: Tool identifier you chose at deploy time.
+    Value: !Ref ToolName
+
+  ToolPort:
+    Description: Port the tool (and NLB) listens on.
+    Value: !Ref ToolPort
+
+  Instructions:
+    Description: Next step.
+    Value: !Sub >
+      Send three values to your BugRaid TAM:
+      (1) Service Name = com.amazonaws.vpce.${AWS::Region}.${EndpointService},
+      (2) Service Region = ${AWS::Region},
+      (3) Tool original hostname (e.g. grafana.your-company.internal — the URL
+      your tool currently uses internally, which is what melt-fetcher will
+      resolve privately on BugRaid's side).
