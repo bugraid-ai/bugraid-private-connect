@@ -1,8 +1,15 @@
 # BugRaid AI — Private Connectivity
 
-Private network connectivity between **your AWS account** and **BugRaid AI's AWS account**, so BugRaid's `melt-fetcher` can read telemetry from internal tools (Grafana, Prometheus, Jira Server, GitHub Enterprise Server, etc.) that only exist inside your VPC — without exposing them to the public internet.
+Private network connectivity between **your network** and **BugRaid AI's AWS account**, so BugRaid's `melt-fetcher` can read telemetry from internal tools (Grafana, Prometheus, Jira Server, GitHub Enterprise Server, OpenSearch, etc.) that aren't exposed to the public internet.
 
-Traffic rides the AWS backbone end-to-end. No internet egress, no VPN tunnel, no shared network, no agent installed in your account.
+Two patterns supported, depending on where your tools live and how many you want to expose. See **[docs/decision-tree.md](docs/decision-tree.md)** to pick the right one for you.
+
+| Pattern | Best for | Customer effort | BugRaid cost |
+|---|---|---|---|
+| **Reverse PrivateLink** (per tool) | 1-3 tools in customer AWS VPC | 1 CFT per tool, ~20 min | ~$19/mo per tool |
+| **Site-to-Site VPN** | Many tools, or tools behind corporate firewall / on-prem | IPsec config on existing firewall, ~1 day | ~$220/mo per customer |
+
+For SaaS tools (Datadog, NewRelic, github.com, atlassian.net) — neither pattern applies; use BugRaid's static egress IP allowlist (no AWS setup needed).
 
 ## What this gets you
 
@@ -52,12 +59,15 @@ Both templates are idempotent and parameterized. Read the [customer runbook](doc
 
 ## Docs
 
-- [Architecture](docs/architecture.md) — the pattern in detail, why this design, what AWS guarantees
-- [Customer runbook](docs/runbook-customer.md) — step-by-step deploy for the customer
-- [BugRaid runbook](docs/runbook-bugraid.md) — step-by-step deploy on our side
+- **[Decision tree](docs/decision-tree.md)** — which pattern fits your setup
+- [Architecture](docs/architecture.md) — how Reverse PrivateLink works
+- [Customer runbook — Reverse PrivateLink](docs/runbook-customer.md) — step-by-step deploy
+- [Customer runbook — Site-to-Site VPN](docs/runbook-s2s-vpn-customer.md) — for VPN-only / on-prem tools
+- [BugRaid runbook — Reverse PrivateLink](docs/runbook-bugraid.md) — internal TAM checklist
+- [BugRaid runbook — Site-to-Site VPN](docs/runbook-s2s-vpn-bugraid.md) — internal TAM checklist
 - [Security FAQ](docs/security-faq.md) — for your security review board
 - [Troubleshooting](docs/troubleshooting.md) — common failures and fixes
-- [Cost estimate](docs/cost-estimate.md) — concrete numbers per tool per month
+- [Cost estimate](docs/cost-estimate.md) — concrete numbers per pattern
 
 ## Examples
 
